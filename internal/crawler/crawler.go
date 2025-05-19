@@ -3,7 +3,9 @@ package crawler
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	whatwg "github.com/nlnwa/whatwg-url/url"
@@ -11,6 +13,7 @@ import (
 
 type crawler struct {
 	domain        string
+	startURL      string
 	visitedURLs   sync.Map
 	remainingURLs chan string
 }
@@ -18,7 +21,7 @@ type crawler struct {
 func NewCrawler() *crawler {
 	return &crawler{
 		visitedURLs:   sync.Map{},
-		remainingURLs: make(chan string),
+		remainingURLs: make(chan string, 500),
 	}
 }
 
@@ -30,47 +33,75 @@ func (c *crawler) Visit(url string) error {
 
 	c.domain = whatwgUrl.Host()
 
-	c.scrape(url)
+	c.startURL = whatwgUrl.Href(false)
+	c.scrape()
 
 	return nil
 }
 
-func (c *crawler) scrape(url string) error {
-	whatwgUrl, err := whatwg.Parse(url)
-	if err != nil {
-		return fmt.Errorf("provide valid url")
+func (c *crawler) scrape() {
+
+	workerCount := 200
+	var workerWG sync.WaitGroup
+	var taskWG sync.WaitGroup
+
+	taskWG.Add(1)
+	c.remainingURLs <- c.startURL
+
+	go func() {
+		taskWG.Wait()
+		close(c.remainingURLs)
+	}()
+
+	for range workerCount {
+		workerWG.Add(1)
+		go func() {
+			defer workerWG.Done()
+			for url := range c.remainingURLs {
+				c.processURL(url, &taskWG)
+			}
+		}()
 	}
 
-	if whatwgUrl.Host() != c.domain {
-		return fmt.Errorf("other domain not allowed")
-	}
+	workerWG.Wait()
 
-	res, err := http.Get(url)
-	if err != nil {
-		return err
-	}
+}
 
-	defer res.Body.Close()
-
+func (c *crawler) processURL(url string, taskWG *sync.WaitGroup) {
+	defer taskWG.Done()
 	c.visitedURLs.Store(url, true)
 
-	if res.StatusCode != 200 {
-		return fmt.Errorf("bad status code")
+	client := http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return
 	}
 
-	doc, err := goquery.NewDocumentFromReader(res.Body)
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
 	if err != nil {
-		return err
+		return
 	}
 
 	doc.Find("a").Each(func(i int, s *goquery.Selection) {
-		if newURL, exist := s.Attr("href"); exist {
-			// if _, isVisisted := c.visitedURLs.Load(newURL); !isVisisted {
-			// 	fmt.Println(newURL)
-			// }
-			fmt.Println(newURL)
-
+		if href, ok := s.Attr("href"); ok && strings.HasPrefix(href, "http") {
+			if u, err := whatwg.Parse(href); err == nil && u.Host() == c.domain {
+				next := u.Href(true)
+				if _, loaded := c.visitedURLs.LoadOrStore(next, true); !loaded {
+					select {
+					case c.remainingURLs <- next:
+						taskWG.Add(1)
+						fmt.Println(next)
+					default:
+						c.visitedURLs.Delete(next)
+					}
+				}
+			}
 		}
 	})
-	return nil
+
 }
