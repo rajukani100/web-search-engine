@@ -3,13 +3,40 @@ package crawler
 import (
 	"fmt"
 	"net/http"
+	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
-	whatwg "github.com/nlnwa/whatwg-url/url"
 )
+
+var mediaExtensions = []string{
+	".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", // images
+	".svg", ".ico", // icons
+	".mp4", ".webm", ".ogg", ".avi", ".mov", ".mkv", // videos
+	".mp3", ".wav", ".flac", ".aac", // audio
+	".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", // documents
+	".zip", ".rar", ".tar", ".gz", ".7z", // archives
+	".exe", ".bin", ".dmg", ".apk", // binaries
+	".css", ".js", // optionally block static assets
+}
+
+func isMediaURL(u string) bool {
+	parsed, err := url.Parse(u)
+	if err != nil {
+		return false
+	}
+	ext := strings.ToLower(filepath.Ext(parsed.Path))
+	for _, mediaExt := range mediaExtensions {
+		if ext == mediaExt {
+			return true
+		}
+	}
+	return false
+}
 
 type crawler struct {
 	domain        string
@@ -21,19 +48,19 @@ type crawler struct {
 func NewCrawler() *crawler {
 	return &crawler{
 		visitedURLs:   sync.Map{},
-		remainingURLs: make(chan string, 500),
+		remainingURLs: make(chan string, 50000),
 	}
 }
 
-func (c *crawler) Visit(url string) error {
-	whatwgUrl, err := whatwg.Parse(url)
-	if err != nil {
+func (c *crawler) Visit(rawURL string) error {
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
 		return fmt.Errorf("provide valid url")
 	}
 
-	c.domain = whatwgUrl.Host()
+	c.domain = parsedURL.Host
 
-	c.startURL = whatwgUrl.Href(false)
+	c.startURL = parsedURL.String()
 	c.scrape()
 
 	return nil
@@ -41,9 +68,10 @@ func (c *crawler) Visit(url string) error {
 
 func (c *crawler) scrape() {
 
-	workerCount := 200
+	workerCount := 5
 	var workerWG sync.WaitGroup
 	var taskWG sync.WaitGroup
+	var taskCount atomic.Uint32
 
 	taskWG.Add(1)
 	c.remainingURLs <- c.startURL
@@ -58,21 +86,23 @@ func (c *crawler) scrape() {
 		go func() {
 			defer workerWG.Done()
 			for url := range c.remainingURLs {
-				c.processURL(url, &taskWG)
+				c.processURL(url, &taskWG, &taskCount)
 			}
 		}()
 	}
 
 	workerWG.Wait()
 
+	fmt.Println("Total Processed URL: ", taskCount.Load())
+
 }
 
-func (c *crawler) processURL(url string, taskWG *sync.WaitGroup) {
+func (c *crawler) processURL(rawUrl string, taskWG *sync.WaitGroup, taskCount *atomic.Uint32) {
 	defer taskWG.Done()
-	c.visitedURLs.Store(url, true)
+	c.visitedURLs.Store(rawUrl, true)
 
 	client := http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(url)
+	resp, err := client.Get(rawUrl)
 	if err != nil {
 		return
 	}
@@ -88,13 +118,49 @@ func (c *crawler) processURL(url string, taskWG *sync.WaitGroup) {
 	}
 
 	doc.Find("a").Each(func(i int, s *goquery.Selection) {
-		if href, ok := s.Attr("href"); ok && strings.HasPrefix(href, "http") {
-			if u, err := whatwg.Parse(href); err == nil && u.Host() == c.domain {
-				next := u.Href(true)
+		if href, ok := s.Attr("href"); ok {
+			var next string
+
+			// Decode href in case it's percent-encoded
+			decodedHref, err := url.PathUnescape(href)
+			if err != nil {
+				decodedHref = href
+			}
+
+			// Try parsing decoded href
+			parsedHref, err := url.Parse(decodedHref)
+			if err != nil {
+				return
+			}
+
+			var resolvedURL *url.URL
+
+			if parsedHref.IsAbs() && parsedHref.Host == c.domain {
+				resolvedURL = parsedHref
+			} else {
+				// Resolve relative URLs
+				baseURL, err := url.Parse(rawUrl) // 'url' is your current page URL
+				if err != nil {
+					return
+				}
+				resolvedURL = baseURL.ResolveReference(parsedHref)
+
+				if resolvedURL.Host != c.domain {
+					return
+				}
+			}
+
+			// Strip query and fragment
+			resolvedURL.RawQuery = ""
+
+			next = resolvedURL.Scheme + "://" + resolvedURL.Host + resolvedURL.EscapedPath()
+
+			if !isMediaURL(next) {
 				if _, loaded := c.visitedURLs.LoadOrStore(next, true); !loaded {
 					select {
 					case c.remainingURLs <- next:
 						taskWG.Add(1)
+						taskCount.Add(1)
 						fmt.Println(next)
 					default:
 						c.visitedURLs.Delete(next)
