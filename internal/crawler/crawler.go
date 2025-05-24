@@ -1,13 +1,17 @@
 package crawler
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -68,10 +72,22 @@ func (c *crawler) Visit(rawURL string) error {
 
 func (c *crawler) scrape() {
 
-	workerCount := 5
+	workerCount := 50
 	var workerWG sync.WaitGroup
 	var taskWG sync.WaitGroup
 	var taskCount atomic.Uint32
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Handle Ctrl+C
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-sigCh
+		cancel() // cancel all workers
+	}()
 
 	taskWG.Add(1)
 	c.remainingURLs <- c.startURL
@@ -85,8 +101,16 @@ func (c *crawler) scrape() {
 		workerWG.Add(1)
 		go func() {
 			defer workerWG.Done()
-			for url := range c.remainingURLs {
-				c.processURL(url, &taskWG, &taskCount)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case url, ok := <-c.remainingURLs:
+					if !ok {
+						return
+					}
+					c.processURL(ctx, url, &taskWG, &taskCount)
+				}
 			}
 		}()
 	}
@@ -97,16 +121,31 @@ func (c *crawler) scrape() {
 
 }
 
-func (c *crawler) processURL(rawUrl string, taskWG *sync.WaitGroup, taskCount *atomic.Uint32) {
+func (c *crawler) processURL(ctx context.Context, rawUrl string, taskWG *sync.WaitGroup, taskCount *atomic.Uint32) {
 	defer taskWG.Done()
-	c.visitedURLs.Store(rawUrl, true)
 
+	select {
+	case <-ctx.Done():
+		return
+	default:
+	}
+	c.visitedURLs.Store(rawUrl, true)
+	fmt.Println("Visiting: ", rawUrl)
 	client := http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(rawUrl)
+
+	req, err := http.NewRequest("GET", rawUrl, nil)
+	if err != nil {
+		return
+	}
+
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 6.3;; en-US) AppleWebKit/602.45 (KHTML, like Gecko) Chrome/52.0.3750.323 Safari/536.7 Edge/10.62018")
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return
 	}
 	defer resp.Body.Close()
+	taskCount.Add(1)
 
 	if resp.StatusCode != http.StatusOK {
 		return
@@ -116,6 +155,21 @@ func (c *crawler) processURL(rawUrl string, taskWG *sync.WaitGroup, taskCount *a
 	if err != nil {
 		return
 	}
+
+	// remove these tags, not usefull
+	doc.Find(`script, style, noscript, head, link, meta, title, 
+	iframe, svg, canvas, img, video, audio, 
+	map, area, object, embed, source, track, 
+	template, picture, param`).Each(func(i int, s *goquery.Selection) {
+		s.Remove()
+	})
+
+	// it stores content from page
+	var content strings.Builder
+
+	doc.Each(func(i int, s *goquery.Selection) {
+		content.Write([]byte(strings.ToLower(s.Text())))
+	})
 
 	doc.Find("a").Each(func(i int, s *goquery.Selection) {
 		if href, ok := s.Attr("href"); ok {
@@ -160,8 +214,6 @@ func (c *crawler) processURL(rawUrl string, taskWG *sync.WaitGroup, taskCount *a
 					select {
 					case c.remainingURLs <- next:
 						taskWG.Add(1)
-						taskCount.Add(1)
-						fmt.Println(next)
 					default:
 						c.visitedURLs.Delete(next)
 					}
